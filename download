@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+pr_saved_data/
+.streamlit/secrets.toml
