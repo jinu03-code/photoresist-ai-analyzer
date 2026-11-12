@@ -1,785 +1,826 @@
-import io
-import math
-import re
-import zipfile
-import json
-import hashlib
+# -*- coding: utf-8 -*-
+"""
+Pattern CD Analyzer
+실행:  streamlit run app.py   (app.py 와 cd_core.py 를 같은 폴더에 두세요)
+"""
+import io, re, json, html, shutil, hashlib, zipfile, datetime
 from pathlib import Path
 
-import streamlit as st
-import cv2
 import numpy as np
 import pandas as pd
+import streamlit as st
+import altair as alt
 from PIL import Image
 
-st.set_page_config(
-    page_title="Photoresist Exposure Optimizer",
-    page_icon="🔬",
-    layout="wide"
-)
+import cd_core as core
 
-st.title("🔬 Photoresist Exposure-Time Analyzer")
-st.caption("7–11 sec exposure comparison · CD · pattern uniformity · defect screening")
+st.set_page_config(page_title="Pattern CD Analyzer", page_icon="🔬", layout="wide",
+                   initial_sidebar_state="collapsed")
 
-# =========================================================
-# 1. 목표 CD / 허용오차 입력 (이미지 업로드보다 먼저 표시)
-# =========================================================
-st.header("1. 목표 CD 및 허용오차 입력")
-goal_col1, goal_col2 = st.columns(2)
-with goal_col1:
-    target_cd = st.number_input(
-        "목표 CD (μm)", min_value=0.01, value=10.0, step=0.1,
-        help="원하는 패턴 직경을 입력하세요."
-    )
-with goal_col2:
-    tolerance_um = st.number_input(
-        "허용오차 (± μm)", min_value=0.0, value=0.5, step=0.1,
-        help="목표 CD에서 허용할 수 있는 최대 차이입니다."
-    )
-lo, hi = target_cd - tolerance_um, target_cd + tolerance_um
-st.success(f"합격 범위: {lo:.3f} ~ {hi:.3f} μm")
-st.caption("개별 패턴 CD가 이 범위 안이면 초록색(합격), 범위를 벗어나면 주황색(불량)으로 표시합니다.")
-
-
-
-def load_image(uploaded_file):
-    image = Image.open(uploaded_file).convert("RGB")
-    return np.array(image)
-
-
-def detect_red_scale_bar(image):
-    """
-    사진 속 빨간색 수평 스케일바를 검출합니다.
-    빨간색 글자보다 길고 가로로 긴 성분을 우선 선택합니다.
-    반환값: (스케일바 길이 px, 양 끝점, 미리보기 이미지) 또는 None
-    """
-    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-
-    # OpenCV HSV에서 빨간색은 Hue 양 끝 구간에 나타날 수 있음
-    red1 = cv2.inRange(
-        hsv, np.array([0, 100, 80]), np.array([12, 255, 255])
-    )
-    red2 = cv2.inRange(
-        hsv, np.array([168, 100, 80]), np.array([179, 255, 255])
-    )
-    red = cv2.bitwise_or(red1, red2)
-
-    h, w = red.shape
-    kernel_width = max(25, min(100, w // 15))
-    horizontal_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (kernel_width, 1)
-    )
-    horizontal = cv2.morphologyEx(
-        red, cv2.MORPH_OPEN, horizontal_kernel
-    )
-
-    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        horizontal, connectivity=8
-    )
-
-    candidates = []
-    for i in range(1, count):
-        x, y, bw, bh, area = stats[i]
-        aspect = bw / max(bh, 1)
-        if bw >= kernel_width and aspect >= 8:
-            candidates.append((bw, x, y, bh, area))
-
-    if not candidates:
-        return None
-
-    # 가장 긴 가로 성분을 스케일바로 간주
-    bw, x, y, bh, area = max(candidates, key=lambda z: z[0])
-
-    # 끝의 수직 캡을 포함한 전체 폭보다 캡 중심 간 거리를 사용
-    # 캡 두께 추정값은 성분 높이와 연결해 보수적으로 제한
-    cap_adjust = min(max(bh - 1, 0), 8)
-    measured_px = float(max(1, bw - cap_adjust))
-
-    x1 = int(round(x + cap_adjust / 2))
-    x2 = int(round(x + bw - 1 - cap_adjust / 2))
-    cy = int(round(y + bh / 2))
-
-    preview = image.copy()
-    cv2.line(
-        preview, (x1, cy), (x2, cy),
-        (0, 255, 0), 3, cv2.LINE_AA
-    )
-    cv2.circle(preview, (x1, cy), 5, (0, 255, 0), -1)
-    cv2.circle(preview, (x2, cy), 5, (0, 255, 0), -1)
-
-    return measured_px, (x1, cy, x2, cy), preview
-
-
-def make_mask(image, h_min, h_max, s_min, v_min):
-    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-
-    lower = np.array([h_min, s_min, v_min])
-    upper = np.array([h_max, 255, 255])
-
-    mask = cv2.inRange(hsv, lower, upper)
-
-    kernel = np.ones((3, 3), np.uint8)
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        kernel
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        kernel
-    )
-
-    return mask
-
-
-def find_reference_radius(reference_image, h_min, h_max, s_min, v_min):
-    mask = make_mask(
-        reference_image,
-        h_min,
-        h_max,
-        s_min,
-        v_min
-    )
-
-    contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not contours:
-        return None
-
-    largest = max(contours, key=cv2.contourArea)
-
-    moments = cv2.moments(largest)
-
-    if moments["m00"] == 0:
-        return None
-
-    cx = int(moments["m10"] / moments["m00"])
-    cy = int(moments["m01"] / moments["m00"])
-
-    area = cv2.contourArea(largest)
-
-    radius = math.sqrt(area / math.pi)
-
-    return cx, cy, radius
-
-
-# =========================================================
-# 3. 패턴 경계 검출
-# =========================================================
-
-def detect_boundary(image, center, expected_radius, tolerance=0.20):
-
-    gray = cv2.cvtColor(
-        image,
-        cv2.COLOR_RGB2GRAY
-    )
-
-    lab = cv2.cvtColor(
-        image,
-        cv2.COLOR_RGB2LAB
-    )
-
-    L = lab[:, :, 0].astype(np.float32)
-
-    # 노이즈 완화
-    L = cv2.GaussianBlur(L, (5, 5), 1.2)
-
-    gradient_x = cv2.Sobel(
-        L,
-        cv2.CV_32F,
-        1,
-        0,
-        ksize=3
-    )
-
-    gradient_y = cv2.Sobel(
-        L,
-        cv2.CV_32F,
-        0,
-        1,
-        ksize=3
-    )
-
-    gradient = cv2.magnitude(
-        gradient_x,
-        gradient_y
-    )
-
-    cx, cy = center
-
-    height, width = gray.shape
-
-    angles = np.linspace(
-        0,
-        2 * np.pi,
-        360,
-        endpoint=False
-    )
-
-    boundary_points = []
-
-    min_radius = expected_radius * (1 - tolerance)
-    max_radius = expected_radius * (1 + tolerance)
-
-    for angle in angles:
-
-        best_score = -1
-        best_point = None
-
-        for radius in np.arange(
-            min_radius,
-            max_radius,
-            1.0
-        ):
-
-            x = int(cx + radius * np.cos(angle))
-            y = int(cy + radius * np.sin(angle))
-
-            if (
-                x < 2 or x >= width - 2
-                or y < 2 or y >= height - 2
-            ):
-                continue
-
-            score = gradient[y, x]
-
-            if score > best_score:
-                best_score = score
-                best_point = (x, y)
-
-        if best_point is not None:
-            boundary_points.append(best_point)
-
-    if len(boundary_points) < 180:
-        return None
-
-    boundary_points = np.array(
-        boundary_points,
-        dtype=np.int32
-    )
-
-    return boundary_points
-
-
-# =========================================================
-# 4. CD 계산
-# =========================================================
-
-def calculate_diameters(boundary):
-
-    points = boundary.astype(np.float32)
-
-    if len(points) < 5:
-        return None
-
-    # 최소 외접 회전 사각형 기반 Feret 직경
-    rect = cv2.minAreaRect(points)
-
-    width, height = rect[1]
-
-    max_feret = max(width, height)
-    min_feret = min(width, height)
-
-    # 등가직경 계산
-    contour = boundary.reshape(-1, 1, 2)
-
-    area = cv2.contourArea(contour)
-    perimeter = cv2.arcLength(contour, True)
-
-    if area <= 0:
-        return None
-
-    equivalent_diameter = 2 * math.sqrt(
-        area / math.pi
-    )
-
-    circularity = (
-        4 * math.pi * area / (perimeter ** 2)
-        if perimeter > 0 else 0
-    )
-
-    aspect_ratio = (
-        max_feret / min_feret
-        if min_feret > 0 else 0
-    )
-
-    return {
-        "Equivalent Diameter (px)": equivalent_diameter,
-        "Max Feret (px)": max_feret,
-        "Min Feret (px)": min_feret,
-        "Circularity": circularity,
-        "Aspect Ratio": aspect_ratio,
-        "Area (px²)": area
-    }
-
-
-# =========================================================
-# 5. CD 라벨 표시 함수
-# =========================================================
-
-def draw_cd_label(image, x, y, text, number, index):
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    # 글씨 크기 소폭 축소
-    font_scale = 0.70
-    thickness = 2
-
-    (tw, th), baseline = cv2.getTextSize(
-        text,
-        font,
-        font_scale,
-        thickness
-    )
-
-    height, width = image.shape[:2]
-
-    # 기본적으로 패턴 중심 위에 표시
-    tx = int(x - tw / 2)
-    ty = int(y - 30)
-
-    # 이미지 경계 밖으로 나가지 않도록 조정
-    tx = max(4, min(tx, width - tw - 4))
-    ty = max(th + 8, min(ty, height - baseline - 4))
-
-    # 표시선 시작점과 끝점
-    line_start = (
-        int(x),
-        int(y) - 5
-    )
-
-    line_end = (
-        int(x),
-        int(ty + 6)
-    )
-
-    # 얇은 검정색 표시선
-    cv2.line(
-        image,
-        line_start,
-        line_end,
-        (0, 0, 0),
-        1,
-        cv2.LINE_AA
-    )
-
-    # 검은색 배경 없이 얇은 외곽선만 적용
-    cv2.putText(
-        image,
-        text,
-        (tx, ty),
-        font,
-        font_scale,
-        (0, 0, 0),
-        3,
-        cv2.LINE_AA
-    )
-
-    # 노란색 CD 글씨
-    cv2.putText(
-        image,
-        text,
-        (tx, ty),
-        font,
-        font_scale,
-        (0, 255, 255),
-        thickness,
-        cv2.LINE_AA
-    )
-
-    # 패턴 번호
-    cv2.putText(
-        image,
-        str(number),
-        (int(x) - 5, int(y) + 18),
-        font,
-        0.45,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA
-    )
-
-
-
-
-# =========================================================
-# 6. CD 라벨 표시
-# =========================================================
-
-def draw_cd_label(image, x, y, text, number, color=(0, 255, 255)):
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.58
-    thickness = 2
-    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
-    h, w = image.shape[:2]
-    tx = max(3, min(int(x - tw / 2), w - tw - 3))
-    ty = max(th + 5, min(int(y - 25), h - baseline - 3))
-    cv2.line(image, (int(x), max(0, int(y)-4)),
-             (int(x), max(0, int(ty)+5)), (0, 0, 0), 1, cv2.LINE_AA)
-    cv2.putText(image, text, (tx, ty), font, scale, (0, 0, 0), 3, cv2.LINE_AA)
-    cv2.putText(image, text, (tx, ty), font, scale, color, thickness, cv2.LINE_AA)
-    cv2.putText(image, str(number), (int(x)+3, min(h-3, int(y)+16)),
-                font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-
-
-def infer_metadata(filename):
-    name = Path(filename).stem.lower()
-    # 우선 7s, 8sec, 9초, exp10 등의 표기를 찾고,
-    # 없으면 파일명 안의 독립된 숫자 토큰(예: sample_7_center)을 인식합니다.
-    exp_match = re.search(r'(?<!\d)(11|10|9|8|7)\s*(?:s|sec|초)(?![a-z])', name)
-    if not exp_match:
-        exp_match = re.search(r'(?:exp|exposure)[_ -]?(11|10|9|8|7)', name)
-    if not exp_match:
-        exp_match = re.search(r'(?:^|[^0-9])(11|10|9|8|7)(?:[^0-9]|$)', name)
-    exposure = int(exp_match.group(1)) if exp_match else None
-
-    die_match = re.search(r'die[_ -]?(\d+)', name)
-    die = f"Die {die_match.group(1)}" if die_match else "Die 1"
-
-    if any(k in name for k in ["left", "lu", "좌상", "좌측상단"]):
-        position = "Left-Upper"
-    elif any(k in name for k in ["right", "rd", "우하", "우측하단"]):
-        position = "Right-Down"
-    elif any(k in name for k in ["center", "centre", "중앙", "중심"]):
-        position = "Center"
-    else:
-        position = "Unspecified"
-    return exposure, die, position
-
-
-def analyze_one(image, um_per_pixel, params, reference_info=None, target_low=None, target_high=None):
-    h_min, h_max, s_min, v_min = params["h_min"], params["h_max"], params["s_min"], params["v_min"]
-    mask = make_mask(image, h_min, h_max, s_min, v_min)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    result_bgr = cv2.cvtColor(image.copy(), cv2.COLOR_RGB2BGR)
-    rows = []
-    min_area = params["min_area"]
-    contours = [c for c in contours if cv2.contourArea(c) >= min_area]
-
-    for contour in contours:
-        moments = cv2.moments(contour)
-        if moments["m00"] == 0:
-            continue
-        cx = int(moments["m10"] / moments["m00"])
-        cy = int(moments["m01"] / moments["m00"])
-        area_mask = cv2.contourArea(contour)
-        mask_radius = math.sqrt(area_mask / math.pi)
-
-        if reference_info is not None:
-            ref_radius = reference_info[2]
-            correction = (params["ref_diameter"] / 2) / ref_radius
-            expected_radius = mask_radius * correction
-        else:
-            expected_radius = mask_radius
-
-        boundary = detect_boundary(
-            image, (cx, cy), expected_radius,
-            tolerance=params["boundary_tolerance"]
-        )
-        if boundary is None:
-            continue
-
-        m = calculate_diameters(boundary)
-        if m is None:
-            continue
-
-        cd_um = m["Equivalent Diameter (px)"] * um_per_pixel
-        max_f = m["Max Feret (px)"] * um_per_pixel
-        min_f = m["Min Feret (px)"] * um_per_pixel
-
-        # 개별 패턴 CD가 목표 허용범위 안이면 초록색, 벗어나면 주황색
-        is_pass = (
-            target_low is not None and target_high is not None
-            and target_low <= cd_um <= target_high
-        )
-        mark_color = (0, 200, 0) if is_pass else (0, 140, 255)  # BGR: green / orange
-        cv2.polylines(result_bgr, [boundary.reshape(-1, 1, 2)],
-                      True, mark_color, 2, cv2.LINE_AA)
-        cv2.circle(result_bgr, (cx, cy), 2, mark_color, -1)
-        label = f"{cd_um:.2f} um {'PASS' if is_pass else 'FAIL'}"
-        draw_cd_label(result_bgr, cx, cy, label, len(rows) + 1, mark_color)
-
-        rows.append({
-            "Pattern_No": len(rows) + 1,
-            "Center_X_px": cx,
-            "Center_Y_px": cy,
-            "CD_um": cd_um,
-            "Max_Feret_um": max_f,
-            "Min_Feret_um": min_f,
-            "Area_um2": m["Area (px²)"] * um_per_pixel**2,
-            "Circularity": m["Circularity"],
-            "Aspect_Ratio": m["Aspect Ratio"],
-        })
-
-    annotated = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-    return rows, annotated, mask
-
-
-def classify_patterns(df):
-    """간단한 영상 기반 선별 규칙. 공정 불량의 확정 판정은 아님."""
-    out = df.copy()
-    out["Flag_Reasons"] = ""
-
-    for idx, row in out.iterrows():
-        reasons = []
-        if pd.notna(row.get("Circularity")) and row["Circularity"] < 0.75:
-            reasons.append("원형도 낮음")
-        if pd.notna(row.get("Aspect_Ratio")) and row["Aspect_Ratio"] > 1.20:
-            reasons.append("비대칭")
-        out.at[idx, "Flag_Reasons"] = "; ".join(reasons)
-    out["Image_Flag"] = np.where(out["Flag_Reasons"] == "", "검토 기준 통과", "검토 필요")
-    return out
-
-
-def build_exposure_summary(pattern_df, image_df, target_cd=None):
-    summaries = []
-    for exp in sorted(image_df["Exposure_s"].dropna().unique()):
-        sub = pattern_df[pattern_df["Exposure_s"] == exp]
-        img_sub = image_df[image_df["Exposure_s"] == exp]
-        if sub.empty:
-            summaries.append({
-                "Exposure_s": exp, "Image_Count": len(img_sub), "Pattern_Count": 0,
-                "Mean_CD_um": np.nan, "SD_CD_um": np.nan, "CV_percent": np.nan,
-                "Mean_Circularity": np.nan, "Mean_AR": np.nan,
-                "Flagged_Pattern_percent": np.nan, "Target_Error_percent": np.nan
-            })
-            continue
-
-        mean_cd = sub["CD_um"].mean()
-        sd_cd = sub["CD_um"].std(ddof=1)
-        cv = sd_cd / mean_cd * 100 if len(sub) > 1 and mean_cd else np.nan
-        target_error = abs(mean_cd - target_cd) / target_cd * 100 if target_cd and target_cd > 0 else np.nan
-        summaries.append({
-            "Exposure_s": exp,
-            "Image_Count": len(img_sub),
-            "Pattern_Count": len(sub),
-            "Mean_CD_um": mean_cd,
-            "SD_CD_um": sd_cd,
-            "CV_percent": cv,
-            "Mean_Circularity": sub["Circularity"].mean(),
-            "Mean_AR": sub["Aspect_Ratio"].mean(),
-            "Flagged_Pattern_percent": (sub["Image_Flag"] == "검토 필요").mean() * 100,
-            "Target_Error_percent": target_error
-        })
-    return pd.DataFrame(summaries)
-
-
-
-with st.sidebar:
-    st.header("분석 설정")
-    scale_um = st.number_input("스케일바 길이 (μm)", min_value=0.1, value=50.0)
-    h_min = st.slider("Hue 최소", 0, 179, 90)
-    h_max = st.slider("Hue 최대", 0, 179, 160)
-    s_min = st.slider("채도 최소", 0, 255, 30)
-    v_min = st.slider("명도 최소", 0, 255, 30)
-    min_area = st.number_input("최소 패턴 면적 (px²)", min_value=1, value=100)
-    boundary_tolerance = st.slider("경계 탐색 범위 (%)", 5, 40, 20)/100
-    circularity_limit = st.slider("원형도 검토 기준", 0.4, 0.99, 0.75)
-    aspect_limit = st.slider("비대칭 검토 기준 (AR)", 1.0, 2.0, 1.2)
-
-# Persistent local storage: original images, calibration and analyzed images.
+# ------------------------------------------------------------ 저장 폴더
 ROOT = Path(__file__).resolve().parent
-STORE = ROOT/"pr_saved_data"
-ORIGINALS = STORE/"original_images"
-ANALYZED = STORE/"analyzed_images"
-for folder in (STORE, ORIGINALS, ANALYZED): folder.mkdir(parents=True, exist_ok=True)
-MANIFEST = STORE/"manifest.json"
-CALFILE = STORE/"calibration.json"
+STORE = ROOT / "saved_data"
+ORIGINALS = STORE / "original_images"
+ANALYZED = STORE / "analyzed_images"
+for _f in (STORE, ORIGINALS, ANALYZED):
+    _f.mkdir(parents=True, exist_ok=True)
+MANIFEST = STORE / "manifest.json"
+CALFILE = STORE / "umpx_table.json"
+IMG_TYPES = ["png", "jpg", "jpeg", "tif", "tiff", "bmp"]
+MAG_LABELS = [f"×{m}" for m in core.MAGS]
+
+ADV_DEFAULT = dict(outlier_pct=5.0, band=0.1, ovality=1.10, rough=3.0, design_pitch=0.0, show_all=False)
+
 
 def read_json(path, default):
-    try: return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
-    except Exception: return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+    except Exception:
+        return default
+
 
 def write_json(path, obj):
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
 def safe_name(v):
     return re.sub(r"[^A-Za-z0-9가-힣_.-]+", "_", str(v)).strip("._") or "image"
 
-# Scale-bar calibration saved after first use.
-st.header("2. 50 μm 스케일바 보정")
-calibration = read_json(CALFILE, {})
-cal_file = st.file_uploader("50 μm 스케일바가 있는 대표 이미지 (최초 1회)", type=["png","jpg","jpeg","tif","tiff"], key="calibration_upload")
-um_per_pixel = calibration.get("um_per_pixel")
-if cal_file:
-    ci = load_image(cal_file)
-    det = detect_red_scale_bar(ci)
-    if det:
-        px, ends, preview = det
-        ratio = scale_um/px
-        st.image(preview, caption="검출된 스케일바 확인", use_container_width=True)
-        st.write(f"검출 길이 {px:.2f} px · 환산율 {ratio:.6f} μm/px")
-        if st.button("스케일바 환산율 저장"):
-            calibration={"scale_um":float(scale_um),"scale_px":float(px),"um_per_pixel":float(ratio)}
-            write_json(CALFILE, calibration); um_per_pixel=ratio
-            st.success("저장 완료. 다음부터 스케일바 이미지를 다시 올릴 필요가 없습니다.")
-    else: st.error("빨간색 가로 스케일바를 검출하지 못했습니다.")
-elif um_per_pixel:
-    st.success(f"저장된 환산율 사용 중: {um_per_pixel:.6f} μm/px")
-else:
-    st.warning("최초 1회 스케일바 환산율을 저장해야 합니다.")
 
-# Three separate upload slots.
-st.header("3. 촬영 위치별 이미지 업로드")
-st.caption("각 칸에 여러 장 업로드 가능. 파일명에 7s/8s/9s/10s/11s, Die1 등을 넣으면 자동 분류합니다.")
-c1,c2,c3=st.columns(3)
-with c1: center_files=st.file_uploader("① Center · 중앙",type=["png","jpg","jpeg","tif","tiff"],accept_multiple_files=True,key="center_upload")
-with c2: left_files=st.file_uploader("② Left-Upper · 왼쪽 위",type=["png","jpg","jpeg","tif","tiff"],accept_multiple_files=True,key="left_upload")
-with c3: right_files=st.file_uploader("③ Right-Down · 오른쪽 아래",type=["png","jpg","jpeg","tif","tiff"],accept_multiple_files=True,key="right_upload")
+def num_or_none(v):
+    try:
+        if v is None or v == "" or (isinstance(v, float) and np.isnan(v)):
+            return None
+        return float(v)
+    except Exception:
+        return None
 
-new=[]
-for pos, files in [("Center",center_files or []),("Left-Upper",left_files or []),("Right-Down",right_files or [])]:
+
+def txt(v):
+    return "" if v is None or (isinstance(v, float) and np.isnan(v)) else str(v).strip()
+
+
+def mag_from_label(v):
+    v = txt(v)
+    return int(v.replace("×", "")) if v else None
+
+
+def mag_label(m):
+    return f"×{int(m)}" if m else ""
+
+
+def load_umpx_table():
+    table = dict(core.DEFAULT_UMPX)
+    for k, v in read_json(CALFILE, {}).items():
+        try:
+            table[int(k)] = float(v)
+        except Exception:
+            pass
+    return table
+
+
+def infer_meta(filename):
+    """파일 이름에 조건이 들어 있으면 자동으로 채웁니다. 없으면 비워 둡니다(막지 않음)."""
+    low = Path(filename).stem.lower()
+    mag = None
+    for pat in (r"(?:x|×)\s*(\d+)", r"(\d+)\s*(?:x|배)(?![a-z])"):
+        for mm in re.finditer(pat, low):
+            if int(mm.group(1)) in core.MAGS:
+                mag = int(mm.group(1))
+                break
+        if mag:
+            break
+    cond = ""
+    m = re.search(r"(?<![\d.])(\d+(?:\.\d+)?)\s*mj(?![a-z])", low)
+    if m:
+        cond = f"{float(m.group(1)):g}mJ"
+    else:
+        m = (re.search(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(?:s|sec|초)(?![a-z])", low)
+             or re.search(r"(?:exp|exposure)[_ -]?(\d+(?:\.\d+)?)", low))
+        if m:
+            cond = f"{float(m.group(1)):g}초"
+    tokens = set(re.split(r"[^a-z0-9가-힣]+", low))
+    pos = ""
+    if tokens & {"center", "centre", "m", "중앙", "중심"}:
+        pos = "Center"
+    elif tokens & {"lu", "left", "ul", "좌상"}:
+        pos = "Left-Upper"
+    elif tokens & {"rd", "right", "br", "우하"}:
+        pos = "Right-Down"
+    p = re.search(r"(?:^|[_ -])(p\d+)(?=$|[_ -])", low)
+    return dict(mag=mag, cond=cond, pos=pos, pattern=p.group(1).upper() if p else "")
+
+
+def pitch_label(pitch):
+    if pitch is None or pd.isna(pitch):
+        return "패턴 미확인"
+    r = round(pitch) if pitch < 30 else round(pitch / 5) * 5
+    return f"피치 {r:g}µm"
+
+
+# ------------------------------------------------------------ 초기화 (고급 설정 안)
+for _k, _v in (("upload_ver", 0), ("edit_ver", 0)):
+    st.session_state.setdefault(_k, _v)
+
+
+def clear_folder(folder, backup=True):
+    """폴더 안의 파일을 비웁니다. backup=True면 삭제하지 않고 _backup 폴더로 옮깁니다."""
+    files = [p for p in folder.glob("*") if p.is_file()]
+    if backup and files:
+        dest = STORE / "_backup" / datetime.datetime.now().strftime("%Y%m%d_%H%M%S") / folder.name
+        dest.mkdir(parents=True, exist_ok=True)
+        for p in files:
+            shutil.move(str(p), str(dest / p.name))
+    else:
+        for p in files:
+            p.unlink()
+    return len(files)
+
+
+def reset_results():
+    clear_folder(ANALYZED, backup=False)
+    st.session_state.pop("res", None)
+
+
+def reset_images():
+    clear_folder(ORIGINALS, backup=True)
+    write_json(MANIFEST, [])
+    reset_results()
+    st.session_state["upload_ver"] += 1
+    st.session_state["edit_ver"] += 1
+
+
+def reset_umpx():
+    if CALFILE.exists():
+        CALFILE.unlink()
+
+
+def run_reset(fn):
+    fn()
+    st.session_state["confirm_reset"] = False
+
+
+# ------------------------------------------------------------ 사이드바: 고급 설정 (접혀 있음)
+with st.sidebar:
+    st.header("고급 설정")
+    st.caption("처음에는 건드릴 필요가 없습니다. 기본값에서 바꾸면 결과에 표시됩니다.")
+    outlier_pct = st.slider("이상치 기준 (중앙값 대비 %)", 2.0, 20.0, ADV_DEFAULT["outlier_pct"], 0.5)
+    band = st.number_input("허용 한계 근처 폭 (µm)", min_value=0.0, value=ADV_DEFAULT["band"], step=0.05,
+                           help="허용 한계 안쪽 이 폭 안의 패드는 '경계'(주황)로 표시합니다. 수율에서는 정상으로 계산합니다.")
+    ovality_lim = st.slider("비대칭 검토 기준 (최대/최소 지름)", 1.02, 1.50, ADV_DEFAULT["ovality"], 0.01)
+    rough_lim = st.slider("반지름 변동 검토 기준 (%)", 0.5, 10.0, ADV_DEFAULT["rough"], 0.5,
+                        help="패드 중심에서 경계까지 거리가 방향마다 흔들리는 정도(%). 클수록 울퉁불퉁하거나 찌그러진 패드입니다. 표시만 하고 판정·수율에는 반영하지 않습니다.")
+    design_pitch = st.number_input("설계 피치 (µm, 선택)", min_value=0.0, value=ADV_DEFAULT["design_pitch"], step=0.5,
+                                   help="입력하면 측정한 피치와 비교해 스케일이 맞는지 검산합니다. 0이면 사용하지 않습니다.")
+    show_all = st.checkbox("모든 패드에 CD 숫자 표시", value=ADV_DEFAULT["show_all"])
+
+    with st.expander("공정 변수 입력", expanded=True):
+        process_conditions = {
+            "spin_rpm": st.number_input("Spin coating 회전속도 (rpm)", min_value=0, value=2500, step=100),
+            "soft_bake_temp_c": st.number_input("Soft bake 온도 (°C)", min_value=0.0, value=100.0, step=1.0),
+            "soft_bake_time_s": st.number_input("Soft bake 시간 (s)", min_value=0, value=90, step=5),
+            "exposure_time_s": st.number_input("Exposure 시간 (s)", min_value=0.0, value=9.0, step=0.5),
+            "irb_temp_c": st.number_input("IRB 온도 (°C)", min_value=0.0, value=110.0, step=1.0),
+            "irb_time_s": st.number_input("IRB 시간 (s)", min_value=0, value=90, step=5),
+            "development_time_s": st.number_input("Development 시간 (s)", min_value=0, value=60, step=5),
+            "di_rinse_time_s": st.number_input("DI 세척 시간 (s)", min_value=0, value=60, step=5),
+        }
+
+    umpx_table = load_umpx_table()
+    with st.expander("배율별 기본 환산율 (스케일바가 없을 때 쓰는 추정값)"):
+        t_df = pd.DataFrame([{"배율": f"×{m}", "µm/px": umpx_table[m], "근거": core.UMPX_NOTE.get(m, "")} for m in core.MAGS])
+        t_ed = st.data_editor(t_df, hide_index=True, disabled=["배율", "근거"], key="umpx_editor")
+        if st.button("환산율 저장"):
+            write_json(CALFILE, {str(core.MAGS[i]): float(r["µm/px"]) for i, (_, r) in enumerate(t_ed.iterrows())})
+            st.success("저장했습니다.")
+            st.rerun()
+        st.caption("×5, ×20은 예측값입니다. 그 배율로 찍은 스케일바 이미지로 재서 고친 뒤 사용하세요.")
+
+    with st.expander("초기화"):
+        n_orig = len([p for p in ORIGINALS.glob("*") if p.is_file()])
+        st.caption(f"저장된 원본 이미지 {n_orig}장 · 초기화하면 saved_data/_backup 폴더로 옮겨지고 삭제되지 않습니다.")
+        confirm = st.checkbox("초기화를 진행합니다", key="confirm_reset")
+        st.button("분석 결과만 초기화", disabled=not confirm, on_click=run_reset, args=(reset_results,))
+        st.button("이미지 + 결과 전체 초기화", type="primary", disabled=not confirm, on_click=run_reset, args=(reset_images,))
+        st.button("환산율 기본값으로 되돌리기", disabled=not confirm, on_click=run_reset, args=(reset_umpx,))
+
+changed = []
+if outlier_pct != ADV_DEFAULT["outlier_pct"]: changed.append(f"이상치 기준 {outlier_pct:g}%")
+if band != ADV_DEFAULT["band"]: changed.append(f"허용 한계 근처 폭 {band:g}µm")
+if ovality_lim != ADV_DEFAULT["ovality"]: changed.append(f"비대칭 기준 {ovality_lim:g}")
+if rough_lim != ADV_DEFAULT["rough"]: changed.append(f"반지름 변동 기준 {rough_lim:g}%")
+if design_pitch != ADV_DEFAULT["design_pitch"]: changed.append(f"설계 피치 {design_pitch:g}µm")
+if show_all != ADV_DEFAULT["show_all"]: changed.append("모든 패드 CD 숫자 표시")
+if umpx_table != core.DEFAULT_UMPX: changed.append("배율별 환산율")
+
+# ------------------------------------------------------------ 제목과 목표
+st.title("🔬 Pattern CD Analyzer")
+c1, c2, c3 = st.columns([1, 1, 2])
+with c1:
+    target_cd = st.number_input("목표 CD (µm)", min_value=0.01, value=10.0, step=0.1)
+with c2:
+    tolerance_um = st.number_input("허용오차 (± µm)", min_value=0.0, value=0.5, step=0.1)
+lo, hi = target_cd - tolerance_um, target_cd + tolerance_um
+with c3:
+    st.markdown(f"<div style='padding-top:1.9rem;color:#555'>정상 범위 {lo:.2f} ~ {hi:.2f} µm</div>", unsafe_allow_html=True)
+
+# ------------------------------------------------------------ 이미지 올리기
+st.subheader("이미지")
+manifest = read_json(MANIFEST, [])
+files = st.file_uploader("이미지를 올리세요 (여러 장 가능, 파일 이름은 아무거나 괜찮습니다)", type=IMG_TYPES,
+                         accept_multiple_files=True, key=f"upload_{st.session_state['upload_ver']}")
+if files:
+    known = {x["stored"] for x in manifest}
+    added = 0
     for f in files:
-        exp, die, _ = infer_metadata(f.name)
-        if exp is None:
-            st.warning(f"파일명에서 노광시간을 찾지 못했습니다: {f.name} — 저장 후 목록에서 직접 지정해 주세요.")
-            exp = 9  # 임시값; 저장된 이미지 목록에서 실제 조건으로 수정하도록 안내
-        new.append((f,pos,exp,die))
-if new and st.button("원본 이미지 저장"):
-    manifest=read_json(MANIFEST,[])
-    known={x["stored"] for x in manifest}
-    added=0
-    for f,pos,exp,die in new:
-        raw=f.getvalue(); digest=hashlib.sha256(raw).hexdigest()[:12]
-        ext=Path(f.name).suffix.lower() or ".png"
-        stored=f"{exp}s_{safe_name(die)}_{pos}_{safe_name(Path(f.name).stem)}_{digest}{ext}"
-        if stored in known: continue
-        (ORIGINALS/stored).write_bytes(raw)
-        manifest.append({"stored":stored,"filename":f.name,"exposure":int(exp),"die":die,"position":pos})
-        known.add(stored); added+=1
-    write_json(MANIFEST,manifest)
-    st.success(f"{added}장 저장 완료. 다음 실행부터 다시 업로드하지 않아도 됩니다.")
-    st.rerun()
+        raw = f.getvalue()
+        digest = hashlib.sha256(raw).hexdigest()[:12]
+        stored = f"{safe_name(Path(f.name).stem)}_{digest}{Path(f.name).suffix.lower() or '.png'}"
+        if stored in known:
+            continue
+        (ORIGINALS / stored).write_bytes(raw)
+        meta = infer_meta(f.name)
+        manifest.append(dict(stored=stored, filename=f.name, mag=meta["mag"], bar_um=None, cond=meta["cond"],
+                             pos=meta["pos"], pattern=meta["pattern"], memo=""))
+        known.add(stored)
+        added += 1
+    if added:
+        write_json(MANIFEST, manifest)
+        st.rerun()
 
-manifest=read_json(MANIFEST,[])
-st.subheader("저장된 이미지 및 촬영 조건")
+ev = st.session_state["edit_ver"]
+edited_main = edited_extra = None
 if manifest:
-    meta=pd.DataFrame([{"파일명":x["filename"],"노광시간(초)":x["exposure"],"Die ID":x["die"],"촬영 위치":x["position"]} for x in manifest])
-    edited=st.data_editor(meta,use_container_width=True,hide_index=True,column_config={
-        "노광시간(초)":st.column_config.SelectboxColumn(options=[7,8,9,10,11],required=True),
-        "촬영 위치":st.column_config.SelectboxColumn(options=["Center","Left-Upper","Right-Down"],required=True)
-    },disabled=["파일명"],key="metadata")
-    if st.button("촬영 조건 변경사항 저장"):
-        for i,x in enumerate(manifest):
-            x["exposure"]=int(edited.iloc[i]["노광시간(초)"]); x["die"]=str(edited.iloc[i]["Die ID"]); x["position"]=str(edited.iloc[i]["촬영 위치"])
-        write_json(MANIFEST,manifest); st.success("변경사항 저장"); st.rerun()
-    st.caption(f"원본 {len(manifest)}장 저장 · {ORIGINALS}")
-else: st.info("아직 저장된 이미지가 없습니다.")
+    if len(manifest) >= 2:
+        st.caption("여러 장에 같은 값 넣기")
+        b1, b2, b3 = st.columns([1, 1, 1])
+        with b1:
+            bulk_mag = st.selectbox("배율", MAG_LABELS, index=None, placeholder="선택", key=f"bulk_mag_{ev}")
+        with b2:
+            bulk_bar = st.number_input("스케일바 길이 (µm)", min_value=0.0, value=None, placeholder="예: 50", key=f"bulk_bar_{ev}")
+        with b3:
+            st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+            if st.button("전체에 적용"):
+                for x in manifest:
+                    if bulk_mag:
+                        x["mag"] = mag_from_label(bulk_mag)
+                    if bulk_bar:
+                        x["bar_um"] = float(bulk_bar)
+                write_json(MANIFEST, manifest)
+                st.session_state["edit_ver"] += 1
+                st.rerun()
 
-# Analyze all patterns; only concise exposure summaries are shown.
-st.header("4. 전체 이미지 분석 및 노광시간별 결과")
-if manifest and um_per_pixel:
-    if st.button("저장된 전체 이미지 분석",type="primary"):
-        params={"h_min":h_min,"h_max":h_max,"s_min":s_min,"v_min":v_min,"min_area":int(min_area),"boundary_tolerance":boundary_tolerance}
-        records=[]
-        progress=st.progress(0)
-        for i,item in enumerate(manifest):
-            path=ORIGINALS/item["stored"]
-            if not path.exists(): continue
-            image=load_image(path)
-            rows,annotated,mask=analyze_one(image,float(um_per_pixel),params,None,lo,hi)
-            for row in rows:
-                row.update({"Exposure":int(item["exposure"]),"Die":item["die"],"Position":item["position"],"File":item["filename"]})
-                records.append(row)
-            outname=f'{item["exposure"]}s_{safe_name(item["die"])}_{item["position"]}_{Path(item["stored"]).stem}_analyzed.png'
-            Image.fromarray(annotated).save(ANALYZED/outname)
-            progress.progress((i+1)/len(manifest))
-        if not records:
-            st.error("패턴을 찾지 못했습니다. HSV 범위/최소 면적/경계 탐색 범위를 확인하세요.")
-        else:
-            d=pd.DataFrame(records)
-            d["CD_status"]=np.where(d["CD_um"]<lo,"작음",np.where(d["CD_um"]>hi,"큼","정상"))
-            d["shape_bad"]=(d["Circularity"]<circularity_limit)|(d["Aspect_Ratio"]>aspect_limit)
-            # Equal weighting: mean within each image, then position, then 3 positions.
-            im=d.groupby(["Exposure","Die","Position","File"],as_index=False).agg(
-                image_cd=("CD_um","mean"), shape_rate=("shape_bad","mean"),
-                out_tol_rate=("CD_status",lambda x:(x!="정상").mean()),
-                circ=("Circularity","mean"), ar=("Aspect_Ratio","mean"))
-            pos=im.groupby(["Exposure","Position"],as_index=False).agg(
-                pos_cd=("image_cd","mean"),shape_rate=("shape_rate","mean"),
-                out_tol_rate=("out_tol_rate","mean"),circ=("circ","mean"),ar=("ar","mean"))
-            summ=pos.groupby("Exposure",as_index=False).agg(
-                CD_um=("pos_cd","mean"),
-                position_spread=("pos_cd",lambda x:float(x.max()-x.min())),
-                position_count=("Position","nunique"),
-                shape_rate=("shape_rate","mean"),out_tol_rate=("out_tol_rate","mean"),
-                circularity=("circ","mean"),aspect_ratio=("ar","mean"))
-            summ["CD판정"]=np.where(summ.CD_um < lo, "불량 (CD 작음)",
-                                      np.where(summ.CD_um > hi, "불량 (CD 큼)", "합격"))
-            reports=[]
-            for _,r in summ.iterrows():
-                issues=[]; causes=[]; remedies=[]
-                if r.position_count<3:
-                    issues.append("3개 위치 데이터 불완전"); causes.append("일부 촬영 위치 이미지 누락"); remedies.append("누락 위치 재촬영")
-                if r.CD판정 == "불량 (CD 작음)":
-                    issues.append("불량: 종합 CD가 목표 허용범위보다 작음")
-                    causes.append("노광·현상 조건 또는 경계 판정 기준에 따른 치수 축소 가능성")
-                    remedies.append("인접 노광시간을 비교하고 현상시간·현상액 농도 및 경계 기준 확인")
-                elif r.CD판정 == "불량 (CD 큼)":
-                    issues.append("불량: 종합 CD가 목표 허용범위보다 큼")
-                    causes.append("노광·현상 조건 또는 경계 판정 기준에 따른 치수 확대 가능성")
-                    remedies.append("인접 노광시간과 현상 조건, 마스크 접촉 상태 비교")
+    main_df = pd.DataFrame({
+        "파일": [x["filename"] for x in manifest],
+        "배율": [mag_label(x.get("mag")) or None for x in manifest],
+        "스케일바(µm)": [x.get("bar_um") for x in manifest],
+    })
+    edited_main = st.data_editor(
+        main_df, hide_index=True, key=f"main_{ev}", disabled=["파일"],
+        column_config={
+            "배율": st.column_config.SelectboxColumn("배율", options=MAG_LABELS),
+            "스케일바(µm)": st.column_config.NumberColumn(
+                "스케일바 길이 (µm)", min_value=0.0, step=1.0,
+                help="이미지에 적힌 스케일바 값(µm)을 입력하세요. 지금까지는 ×10: 200, ×50: 50, ×100: 20이었습니다(현미경 설정에 따라 다를 수 있음)."),
+        })
+    with st.expander("추가 정보 (실험 조건 · 위치 · 패턴 · 그룹 메모, 모두 선택 사항)"):
+        extra_df = pd.DataFrame({
+            "파일": [x["filename"] for x in manifest],
+            "실험 조건": [x.get("cond", "") for x in manifest],
+            "위치": [x.get("pos", "") for x in manifest],
+            "패턴": [x.get("pattern", "") for x in manifest],
+            "그룹 메모": [x.get("memo", "") for x in manifest],
+        })
+        edited_extra = st.data_editor(
+            extra_df, hide_index=True, key=f"extra_{ev}", disabled=["파일"],
+            column_config={
+                "실험 조건": st.column_config.TextColumn(
+                    "실험 조건 (바꾼 변수의 값)",
+                    help="이번 실험에서 바꾼 변수의 값을 쓰세요. 예: 7초, 9초, 11초 / 72mJ / 110°C. "
+                         "한 묶음에서는 같은 변수·같은 단위로 쓰면 그래프와 제안이 만들어집니다. 고정한 나머지 조건은 '그룹 메모'에 쓰세요."),
+                "패턴": st.column_config.TextColumn(help="비워 두면 측정한 피치로 자동 구분합니다."),
+                "그룹 메모": st.column_config.TextColumn(help="이번 실험에서 고정한 조건. 예: IRB 110°C 90초 · 현상 60초 · 3.5mJ/s. 같은 메모끼리만 묶여 비교됩니다."),
+            })
+        st.caption("파일 이름에 조건이 들어 있으면 자동으로 채워집니다. 입력한 값은 [분석하기]를 누를 때 저장됩니다.")
+
+
+# ------------------------------------------------------------ 분석
+def analyze_all(manifest, P):
+    pads_all, img_rows, imgdata = [], [], {}
+    prog = st.progress(0.0, text="분석 중...")
+    for i, item in enumerate(manifest):
+        prog.progress((i + 1) / len(manifest), text=f"분석 중... {item['filename']}")
+        path = ORIGINALS / item["stored"]
+        if not path.exists():
+            continue
+        base = {"파일": item["filename"], "배율": mag_label(item.get("mag")), "스케일바(µm)": item.get("bar_um") or np.nan,
+                "실험 조건": txt(item.get("cond")), "위치": txt(item.get("pos")), "그룹 메모": txt(item.get("memo"))}
+        rec = dict(base, _stored=item["stored"], 패턴=txt(item.get("pattern")), 상태="", 안내="", 경고="", 스케일_상태="",
+                   스케일_출처="", **{"µm/px": np.nan})
+        try:
+            img = core.load_rgb(path)
+            sc = core.resolve_scale(img, item.get("mag"), item.get("bar_um"), P["umpx_table"])
+            rec.update(스케일_상태=sc["state"], 스케일_출처=sc["source"], **{"µm/px": sc["um"] if sc["um"] else np.nan})
+            if sc["state"] == "측정 불가":
+                rec.update(상태="측정 불가", 안내=sc["notice"])
+                img_rows.append(rec)
+                continue
+            df, pts, info = core.analyze_image(img, sc["um"], sc["bar"], P["outlier_pct"], P["ovality"], P["rough"])
+            if not info["supported"]:
+                rec.update(상태="지원 안 함", 안내=info["message"])
+                img_rows.append(rec)
+                continue
+            warns = list(sc["warns"])
+            if P["design_pitch"] > 0 and np.isfinite(info["pitch_um"]):
+                err = info["pitch_um"] / P["design_pitch"] - 1
+                if abs(err) > 0.02:
+                    warns.append(f"측정한 피치({info['pitch_um']:.2f}µm)가 설계 피치보다 {err:+.1%} - 스케일을 확인하세요")
+            if info["quality"]:
+                warns.append(info["quality"])
+            pattern = txt(item.get("pattern")) or pitch_label(info["pitch_um"])
+            df["판정"] = [core.judge(v, P["target"], P["tol"], P["band"]) if c == core.C_USED else ""
+                         for v, c in zip(df["CD_um"], df["분류"])]
+            counted = df["분류"].isin([core.C_USED, core.C_DEFECT])
+            df["pad_no"] = np.where(counted, counted.cumsum(), 0)
+            used = df[df["분류"] == core.C_USED]
+            n_def = int((df["분류"] == core.C_DEFECT).sum())
+            in_spec = int(used["판정"].isin(["정상", "경계"]).sum())
+            denom = len(used) + n_def
+            mean_cd = used["CD_um"].mean() if len(used) else np.nan
+            stem = Path(item["stored"]).stem
+            out_name = f"{stem}_analyzed.png"
+            ov = core.render_overlay(img, df, pts, sc["bar"], P["show_all"])
+            Image.fromarray(ov).save(ANALYZED / out_name)
+            rec.update(패턴=pattern, 상태="측정", 안내=sc["notice"], 경고=" / ".join(warns),
+                       **{"사용 패드": int(len(used)), "측정 한계 제외": info["n_limit"], "불량으로 계산": n_def,
+                          "무시한 작은 이물": info["n_ignored"], "평균 CD(µm)": mean_cd,
+                          "CD 중앙값(µm)": used["CD_um"].median() if len(used) else np.nan,
+                          "패드 SD(µm)": used["CD_um"].std() if len(used) > 1 else np.nan,
+                          "수율(%)": in_spec / denom * 100 if denom else np.nan, "피치(µm)": info["pitch_um"],
+                          "분석 이미지": out_name})
+            img_rows.append(rec)
+            df = df.assign(**{k: rec[k] for k in ("파일", "패턴", "배율", "실험 조건", "위치", "그룹 메모", "스케일_상태")})
+            pads_all.append(df)
+            imgdata[item["stored"]] = dict(df=df, pts=pts, out=out_name, file=item["filename"])
+        except Exception as e:                                   # 한 장이 실패해도 나머지는 계속
+            rec.update(상태="분석 오류", 안내=f"{type(e).__name__}: {e}")
+            img_rows.append(rec)
+    prog.empty()
+    images = pd.DataFrame(img_rows)
+    pads = pd.concat(pads_all, ignore_index=True) if pads_all else pd.DataFrame()
+    groups = build_groups(pads, images, P)
+    return dict(images=images, pads=pads, groups=groups, imgdata=imgdata, params=P,
+                files=build_downloads(images, pads, groups, P, changed), changed=changed)
+
+
+def build_groups(pads, images, P):
+    if not len(pads):
+        return pd.DataFrame()
+    keys = ["패턴", "배율", "실험 조건", "그룹 메모", "스케일_상태"]
+    pads = pads.copy()
+    for k in keys:
+        pads[k] = pads[k].fillna("").astype(str)
+    imgs = images[images["상태"] == "측정"].copy()
+    for k in keys:
+        imgs[k] = imgs[k].fillna("").astype(str) if k != "스케일_상태" else imgs[k]
+    rows = []
+    for key, g in pads.groupby(keys, dropna=False):
+        used = g[g["분류"] == core.C_USED]
+        if not len(used):
+            continue
+        n_def = int((g["분류"] == core.C_DEFECT).sum())
+        n_lim = int((g["분류"] == core.C_LIMIT).sum())
+        in_spec = int(used["판정"].isin(["정상", "경계"]).sum())
+        denom = len(used) + n_def
+        mean_cd = used["CD_um"].mean()
+        sel = imgs
+        for k, v in zip(keys, key):
+            sel = sel[sel[k] == v]
+        img_means = sel["평균 CD(µm)"].dropna()
+        pos_means = used[used["위치"] != ""].groupby("위치")["CD_um"].mean()
+        label = " · ".join([x for x in (key[0], key[1], key[2], key[3]) if x])
+        tone_j = core.judge(mean_cd, P["target"], P["tol"], P["band"])
+        rows.append({"조건": label or "조건 미입력", "패턴": key[0], "배율": key[1], "실험 조건": key[2], "그룹 메모": key[3],
+                     "스케일": key[4], "이미지 수": len(sel), "사용 패드": len(used), "측정 한계 제외": n_lim,
+                     "불량으로 계산": n_def, "평균 CD(µm)": mean_cd, "패드 SD(µm)": used["CD_um"].std() if len(used) > 1 else np.nan,
+                     "이미지 간 편차(µm)": img_means.std() if len(img_means) > 1 else np.nan,
+                     "위치 간 편차(µm)": float(pos_means.max() - pos_means.min()) if len(pos_means) > 1 else np.nan,
+                     "목표와 차이(µm)": mean_cd - P["target"], "수율(%)": in_spec / denom * 100 if denom else np.nan,
+                     "신호": {"정상": "🟢", "경계": "🟡"}.get(tone_j, "🔴")})
+    return pd.DataFrame(rows)
+
+
+def _round_cols(df, spec):
+    """CSV에 적는 값만 반올림합니다(화면·계산에 쓰는 원래 값은 바꾸지 않음)."""
+    out = df.copy()
+    for col, nd in spec.items():
+        if col in out.columns:
+            v = pd.to_numeric(out[col], errors="coerce").round(nd)
+            out[col] = v.astype("Int64") if nd == 0 else v
+    return out
+
+
+def build_settings(P, changed_list, n_images):
+    """분석 조건 기록(settings.csv). 한 줄에 항목 하나."""
+    lo_, hi_ = P["target"] - P["tol"], P["target"] + P["tol"]
+    rows = [
+        ("분석", "프로그램", "Pattern CD Analyzer"),
+        ("분석", "분석 날짜", datetime.datetime.now().strftime("%Y-%m-%d %H:%M")),
+        ("분석", "분석한 이미지 수", f"{n_images}장"),
+        ("판정", "목표 CD", f"{P['target']:.2f} µm"),
+        ("판정", "허용오차", f"± {P['tol']:.2f} µm"),
+        ("판정", "정상 범위", f"{lo_:.2f} ~ {hi_:.2f} µm"),
+        ("판정", "허용 한계 근처 폭", f"{P['band']:.2f} µm (경계로 표시, 수율에서는 정상으로 계산)"),
+        ("측정", "경계 기준", f"까만 테두리 바깥 끝 (가장 어두운 곳에서 배경 쪽으로 {core.BOUNDARY_FRAC * 100:.0f}% 밝아지는 지점, 고정)"),
+        ("측정", "지름 계산", "패드 중심에서 180방향으로 경계를 잡고, 마주 보는 두 방향을 더한 지름 90개의 평균"),
+        ("제외", "측정 한계 제외(수율에서 뺌)", "이미지 가장자리에 잘림 / 가장자리 근처 / 스케일바·주석 근처"),
+        ("제외", "불량으로 계산(수율 분모에 포함)",
+         f"크기 이상(합쳐짐·이물) / 경계 검출 실패 / 이상치(중앙값 ±{P['outlier_pct']:g}%와 중앙 절대편차 3배 중 큰 값)"),
+        ("제외", "패드가 아닌 작은 이물", "패드 크기의 절반 미만, 수율에 넣지 않음"),
+        ("수율", "정의", "CD 규격 기준 치수 수율(누락된 패드는 세지 못함) = 허용범위 안(정상+경계) ÷ (사용한 패드 + 불량으로 계산한 패드)"),
+        ("형상", "검토 기준", f"비대칭(최대/최소 지름) {P['ovality']:g}, 반지름 변동 {P['rough']:g}% - 표시만 하고 수율에는 반영하지 않음"),
+    ]
+    for m in core.MAGS:
+        rows.append(("스케일", f"배율 ×{m} 기본 환산율", f"{P['umpx_table'][m]:.4f} µm/px ({core.UMPX_NOTE.get(m, '')})"))
+    rows.append(("스케일", "스케일바가 없을 때", "배율 기본값으로 계산하고 '추정'으로 표시, 둘 다 없으면 측정 불가"))
+    if P["design_pitch"] > 0:
+        rows.append(("스케일", "설계 피치(검산용)", f"{P['design_pitch']:g} µm"))
+    for key, value in P.get("process_conditions", {}).items():
+        rows.append(("공정 조건", key, value))
+    rows.append(("변경", "기본값에서 바꾼 설정", ", ".join(changed_list) if changed_list else "없음"))
+    return pd.DataFrame(rows, columns=["구분", "항목", "값"])
+
+
+def build_downloads(images, pads, groups, P, changed_list):
+    out = {"pads": b""}                                       # 측정된 패드가 하나도 없어도 내려받기가 깨지지 않게 기본값을 둠
+    cols = ["파일", "패턴", "배율", "스케일_상태", "실험 조건", "위치", "그룹 메모", "pad_no", "분류", "reason", "CD_um",
+            "D_min_um", "D_max_um", "ovality", "rough_pct", "판정", "형상 검토", "cx", "cy"]
+    if len(pads):
+        pc = pads[[c for c in cols if c in pads.columns]].rename(columns={
+            "스케일_상태": "스케일 상태", "reason": "사유", "CD_um": "CD(µm)", "D_min_um": "최소 지름(µm)", "D_max_um": "최대 지름(µm)",
+            "ovality": "최대/최소 지름", "rough_pct": "반지름 변동(%)", "cx": "중심 x(px)", "cy": "중심 y(px)"})
+        pc = _round_cols(pc, {"CD(µm)": 2, "최소 지름(µm)": 2, "최대 지름(µm)": 2, "최대/최소 지름": 2, "반지름 변동(%)": 1,
+                              "중심 x(px)": 0, "중심 y(px)": 0})
+        out["pads"] = pc.to_csv(index=False).encode("utf-8-sig")
+    ic = images.drop(columns=[c for c in ("_stored",) if c in images.columns]).rename(
+        columns={"스케일_상태": "스케일 상태", "스케일_출처": "스케일 출처"})
+    ic = _round_cols(ic, {"µm/px": 4, "평균 CD(µm)": 2, "CD 중앙값(µm)": 2, "패드 SD(µm)": 2, "수율(%)": 0, "피치(µm)": 2})
+    out["images"] = ic.to_csv(index=False).encode("utf-8-sig")
+    gc = _round_cols(groups, {"평균 CD(µm)": 2, "패드 SD(µm)": 2, "이미지 간 편차(µm)": 2, "위치 간 편차(µm)": 2,
+                              "목표와 차이(µm)": 2, "수율(%)": 0}) if len(groups) else groups
+    out["groups"] = (gc.to_csv(index=False) if len(gc) else "").encode("utf-8-sig")
+    out["settings"] = build_settings(P, changed_list, int((images["상태"] == "측정").sum()) if len(images) else 0
+                                     ).to_csv(index=False).encode("utf-8-sig")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for k, name in (("pads", "pads.csv"), ("images", "images.csv"), ("groups", "summary.csv"), ("settings", "settings.csv")):
+            zf.writestr(name, out[k])
+        for p in ANALYZED.glob("*_analyzed.png"):
+            zf.write(p, f"analyzed_images/{p.name}")
+    out["zip"] = buf.getvalue()
+    return out
+
+
+P_now = dict(target=target_cd, tol=tolerance_um, band=band, outlier_pct=outlier_pct, ovality=ovality_lim, rough=rough_lim,
+             design_pitch=design_pitch, show_all=show_all, umpx_table=umpx_table,
+             process_conditions=process_conditions)
+
+if manifest:
+    if st.button("분석하기", type="primary"):
+        for i, x in enumerate(manifest):
+            x["mag"] = mag_from_label(edited_main.iloc[i]["배율"])
+            x["bar_um"] = num_or_none(edited_main.iloc[i]["스케일바(µm)"])
+            x["cond"] = txt(edited_extra.iloc[i]["실험 조건"])
+            x["pos"] = txt(edited_extra.iloc[i]["위치"])
+            x["pattern"] = txt(edited_extra.iloc[i]["패턴"])
+            x["memo"] = txt(edited_extra.iloc[i]["그룹 메모"])
+        write_json(MANIFEST, manifest)
+        st.session_state["res"] = analyze_all(manifest, P_now)
+
+# ------------------------------------------------------------ 결과
+TONE = {"good": ("#E3F4EA", "#176B3A"), "warn": ("#FFF0D6", "#9A5B00"), "bad": ("#FCE4E4", "#A61B1B"),
+        "neutral": ("#EEF1F5", "#2B2F36")}
+
+
+def card(title, value, sub="", note="", tone="neutral"):
+    bg, fg = TONE[tone]
+    return (f"<div style='background:{bg};border-radius:12px;padding:14px 16px;height:100%'>"
+            f"<div style='font-size:0.85rem;color:#4a4f57'>{html.escape(title)}</div>"
+            f"<div style='font-size:2.1rem;font-weight:700;color:{fg};line-height:1.25'>{html.escape(value)}</div>"
+            f"<div style='font-size:0.82rem;color:#3d4249'>{html.escape(sub)}</div>"
+            f"<div style='font-size:0.72rem;color:#5b616a;margin-top:4px'>{html.escape(note)}</div></div>")
+
+
+def tone_of(mean, P):
+    j = core.judge(mean, P["target"], P["tol"], P["band"])
+    return {"정상": "good", "경계": "warn"}.get(j, "bad")
+
+
+def show_cards(g, P):
+    sd = g["패드 SD(µm)"]
+    sub_cd = f"패드 간 편차 ±{sd:.2f} µm" if pd.notna(sd) else ""
+    if pd.notna(g["이미지 간 편차(µm)"]):
+        sub_cd += f" · 이미지 간 ±{g['이미지 간 편차(µm)']:.2f}"
+    if pd.notna(g["위치 간 편차(µm)"]):
+        sub_cd += f" · 위치 간 {g['위치 간 편차(µm)']:.2f}"
+    tone = tone_of(g["평균 CD(µm)"], P)
+    diff = g["목표와 차이(µm)"]
+    mark = {"good": "✓ ", "warn": "△ ", "bad": "✕ "}[tone]
+    word = "목표와 같음" if abs(diff) < 0.005 else ("목표보다 큼" if diff > 0 else "목표보다 작음")
+    cols = st.columns(4)
+    cols[0].markdown(card("평균 CD", f"{g['평균 CD(µm)']:.2f} µm", sub_cd, "경계 기준: 까만 테두리 바깥 끝", tone), unsafe_allow_html=True)
+    cols[1].markdown(card("목표와 차이", f"{mark}{diff:+.2f} µm", f"{word} · 허용 ±{P['tol']:g} µm", "", tone), unsafe_allow_html=True)
+    y = g["수율(%)"]
+    cols[2].markdown(card("수율", f"{y:.0f} %" if pd.notna(y) else "-", f"규격 {P['target'] - P['tol']:.2f}~{P['target'] + P['tol']:.2f} µm",
+                          "CD 규격 기준 치수 수율(누락된 패드는 세지 못함)"), unsafe_allow_html=True)
+    few = g["사용 패드"] < 7
+    cols[3].markdown(card("측정 패드 수", f"{int(g['사용 패드'])} 개",
+                          f"제외 {int(g['측정 한계 제외'] + g['불량으로 계산'])}개 (측정 한계 {int(g['측정 한계 제외'])} · 불량 {int(g['불량으로 계산'])})",
+                          "패드가 적어 숫자를 믿기 어렵습니다" if few else "", "warn" if few else "neutral"), unsafe_allow_html=True)
+
+
+def cond_axis(conds):
+    """모든 조건이 '숫자+같은 단위'이면 숫자축, 아니면 글자축"""
+    parsed = []
+    for c in conds:
+        m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*(.*)$", str(c))
+        if not m:
+            return None
+        parsed.append((float(m.group(1)), m.group(2).strip()))
+    units = {u for _, u in parsed}
+    return (dict(zip(conds, [p[0] for p in parsed])), units.pop()) if len(units) == 1 else None
+
+
+def group_chart(imgs, groups, P):
+    g = groups[groups["실험 조건"] != ""].copy()
+    g["스케일_상태"] = g["스케일"]
+    conds = list(dict.fromkeys(g["실험 조건"]))
+    ax = cond_axis(conds)
+    im = imgs[(imgs["상태"] == "측정") & (imgs["실험 조건"] != "")].copy()
+    im["계열"] = im["패턴"].astype(str) + " " + im["배율"].astype(str)
+    g["계열"] = g["패턴"].astype(str) + " " + g["배율"].astype(str)
+    if ax:
+        mp, unit = ax
+        im["x"], g["x"] = im["실험 조건"].map(mp), g["실험 조건"].map(mp)
+        allx = list(im["x"]) + list(g["x"])
+        span = max(max(allx) - min(allx), 1e-9)
+        pad = span * 0.08 if span > 1e-6 else 0.5
+        xenc = alt.X("x:Q", title=f"실험 조건 ({unit})" if unit else "실험 조건",
+                     scale=alt.Scale(domain=[min(allx) - pad, max(allx) + pad], nice=False),
+                     axis=alt.Axis(values=sorted(set(allx))))
+    else:
+        im["x"], g["x"] = im["실험 조건"], g["실험 조건"]
+        xenc = alt.X("x:N", sort=conds, title="실험 조건")
+    ys = list(im["평균 CD(µm)"]) + list(g["평균 CD(µm)"]) + [P["target"] - P["tol"], P["target"] + P["tol"]]
+    ydom = [min(ys) - 0.3, max(ys) + 0.3]
+    yenc = alt.Y("평균 CD(µm):Q", title="CD (µm)", scale=alt.Scale(domain=ydom))
+    shape = alt.Shape("스케일_상태:N", scale=alt.Scale(domain=["정확", "추정"], range=["circle", "diamond"]), title="스케일")
+    color = alt.Color("계열:N", title="패턴·배율")
+    band = alt.Chart(pd.DataFrame({"a": [P["target"] - P["tol"]], "b": [P["target"] + P["tol"]]})).mark_rect(
+        opacity=0.13, color="#2e9e6b").encode(y=alt.Y("a:Q", scale=alt.Scale(domain=ydom)), y2="b:Q")
+    pts = alt.Chart(im).mark_point(size=60, filled=True, opacity=0.5).encode(
+        x=xenc, y=yenc, color=color, shape=shape, tooltip=["파일", "실험 조건", alt.Tooltip("평균 CD(µm):Q", format=".3f")])
+    layers = [band, pts]
+    g_acc, g_est = g[g["스케일_상태"] == "정확"], g[g["스케일_상태"] == "추정"]
+    if len(g_acc):
+        layers.append(alt.Chart(g_acc).mark_line(point=alt.OverlayMarkDef(size=130, filled=True)).encode(x=xenc, y=yenc, color=color))
+    if len(g_est):                                              # 추정 평균은 선 없이 속이 빈 마름모로만 표시
+        layers.append(alt.Chart(g_est).mark_point(size=150, shape="diamond", filled=False, strokeWidth=2.5).encode(
+            x=xenc, y=yenc, color=color))
+    return alt.layer(*layers).properties(height=320)
+
+
+def hist_chart(cd, P):
+    d = pd.DataFrame({"CD": cd})
+    x0, x1 = min(d["CD"].min(), P["target"] - P["tol"]) - 0.3, max(d["CD"].max(), P["target"] + P["tol"]) + 0.3
+    sc = alt.Scale(domain=[x0, x1])
+    bars = alt.Chart(d).mark_bar(color="#5b8def").encode(
+        x=alt.X("CD:Q", bin=alt.Bin(maxbins=20, extent=[x0, x1]), title="패드별 CD (µm)", scale=sc), y=alt.Y("count()", title="패드 수", axis=alt.Axis(tickMinStep=1)))
+    band = alt.Chart(pd.DataFrame({"a": [P["target"] - P["tol"]], "b": [P["target"] + P["tol"]]})).mark_rect(
+        opacity=0.15, color="#2e9e6b").encode(x=alt.X("a:Q", scale=sc), x2="b:Q")
+    rule = alt.Chart(pd.DataFrame({"t": [P["target"]]})).mark_rule(color="#2e9e6b", strokeDash=[4, 3]).encode(x=alt.X("t:Q", scale=sc))
+    return (band + bars + rule).properties(height=230)
+
+
+def show_image_card(row, res, k):
+    P, imgdata = res["params"], res["imgdata"]
+    with st.container(border=True):
+        if row["상태"] != "측정":
+            st.markdown(f"**⚪ {row['파일']}**")
+            (st.error if row["상태"] == "분석 오류" else st.warning)(f"{row['상태']}: {row['안내']}")
+            return
+        mean = row["평균 CD(µm)"]
+        tone = tone_of(mean, P) if pd.notna(mean) else "bad"
+        sig = {"good": "🟢", "warn": "🟡", "bad": "🔴"}[tone]
+        tag = "📏 스케일 정확" if row["스케일_상태"] == "정확" else "⚠ 스케일 추정"
+        a, b = st.columns([1, 3])
+        with a:
+            st.image(str(ANALYZED / row["분석 이미지"]), width=260)
+        with b:
+            st.markdown(f"**{sig} {row['파일']}** · {tag}")
+            st.markdown(f"CD **{mean:.2f} µm** (목표와 {mean - P['target']:+.2f}) · 수율 **{row['수율(%)']:.0f}%** · 사용 {int(row['사용 패드'])}개")
+            if row["스케일_상태"] == "추정" and row["안내"]:
+                st.warning(row["안내"])
+            if row["경고"]:
+                st.caption("⚠ " + row["경고"])
+            idata = imgdata.get(row["_stored"])
+            nshape = int((idata["df"]["형상 검토"] != "").sum()) if idata else 0
+            if nshape:
+                st.caption(f"형상 검토 표시 패드 {nshape}개 (비대칭 또는 반지름 변동 큼) - 자세히 보기의 표에서 확인하세요")
+        with st.expander("자세히 보기"):
+            if not idata:
+                return
+            df = idata["df"]
+            st.caption(core.LEGEND)
+            if core.numbers_suppressed(df, P["show_all"]):
+                st.caption("규격 밖 패드가 많아 그림에는 CD 숫자를 표시하지 않았습니다. 아래 표에서 확인하세요.")
+            box = st.container()
+            tbl = df[df["분류"].isin([core.C_USED, core.C_DEFECT])][["pad_no", "분류", "reason", "CD_um", "판정", "형상 검토"]].rename(
+                columns={"분류": "구분", "reason": "사유", "CD_um": "CD(µm)", "pad_no": "번호"})
+            sel_idx = None
+            h1, h2 = st.columns([2, 1])
+            with h2:
+                used = df[df["분류"] == core.C_USED]["CD_um"]
+                if len(used):
+                    st.altair_chart(hist_chart(used, P))
+                ex = row.get("무시한 작은 이물", 0)
+                st.caption(f"제외: 측정 한계 {int(row['측정 한계 제외'])}개 · 불량으로 계산 {int(row['불량으로 계산'])}개"
+                           + (f" · 패드가 아닌 작은 이물 {int(ex)}개(수율에 넣지 않음)" if ex else ""))
+            with h1:
+                st.caption("표에서 행을 누르면 그 패드가 그림에서 강조됩니다.")
+                ev_ = st.dataframe(tbl, hide_index=True, on_select="rerun", selection_mode="single-row", key=f"sel_{k}",
+                                   column_config={"CD(µm)": st.column_config.NumberColumn(format="%.2f")})
+                rows = getattr(getattr(ev_, "selection", None), "rows", None) or []
+                if rows:
+                    sel_idx = int(tbl.index[rows[0]])
+            with box:
+                if sel_idx is not None:
+                    img = core.load_rgb(ORIGINALS / row["_stored"])
+                    bar = core.detect_scale_bar(img)
+                    st.image(core.render_overlay(img, df, idata["pts"], bar, P["show_all"], highlight=sel_idx))
                 else:
-                    issues.append("합격: 종합 CD가 목표 허용범위 안에 있음")
-                if r.position_spread>max(tolerance_um,0.1):
-                    issues.append("위치별 CD 편차 큼"); causes.append("조명·초점·레벨링, PR 막 두께, 마스크 접촉 또는 현상 균일성 차이 가능성"); remedies.append("세 위치의 초점·조명·PR 두께·마스크 접촉·현상 상태 점검")
-                if r.out_tol_rate>0.1:
-                    issues.append("개별 패턴 중 허용오차 초과 패턴 존재"); causes.append("패턴 간 치수 편차 또는 국부 공정 불균일"); remedies.append("도포·베이크·노광·현상 조건을 고정하고 반복 Die 측정")
-                if r.shape_rate>0.1:
-                    issues.append("원형도 저하/비대칭 패턴 관찰"); causes.append("초점 불량, 마스크 접촉, 현상 불균일 또는 광학 경계 오검출 가능성"); remedies.append("저장된 분석 이미지를 확대해 실제 변형과 경계 오검출 구분")
-                reports.append({"노광시간":f"{int(r.Exposure)}초",
-                    "종합 CD":f"{r.CD_um:.3f} μm",
-                    "최종 결과": "합격" if r.CD판정 == "합격" else "불량",
-                    "불량 판정": " · ".join(issues),
-                    "가능 원인":" · ".join(dict.fromkeys(causes)) if causes else "뚜렷한 이상 신호가 적음",
-                    "개선 방향":" · ".join(dict.fromkeys(remedies)) if remedies else "현재 조건으로 반복 Die 측정해 재현성 확인"})
-            # rank: target deviation, location spread, geometry flags
-            summ["score"]=(summ.CD_um-target_cd).abs()/target_cd*100+summ.position_spread/target_cd*100+summ.shape_rate*100
-            passing = summ[summ["CD판정"] == "합격"]
-            best = (passing.sort_values("score").iloc[0]
-                    if not passing.empty else summ.sort_values("score").iloc[0])
-            st.session_state["reports"]=reports; st.session_state["summary"]=summ.to_dict("records")
-            st.session_state["best"]=int(best.Exposure)
-            st.success(
-                f'현재 데이터 기준 추천 노광시간: {int(best.Exposure)}초 · '
-                f'종합 CD {best.CD_um:.3f} μm · {best.CD판정}'
-            )
-            st.caption("세 위치를 동일 가중치로 통합한 1차 후보이며, 공정 최적 조건 확정은 반복 실험으로 검증해야 합니다.")
+                    st.image(str(ANALYZED / row["분석 이미지"]))
 
-if "reports" in st.session_state:
-    st.subheader("노광시간별 결과 요약")
-    st.dataframe(pd.DataFrame(st.session_state["reports"]),use_container_width=True,hide_index=True)
-    st.subheader("노광시간별 종합 CD")
-    chart=pd.DataFrame(st.session_state["summary"])
-    st.bar_chart(chart.set_index("Exposure")[["CD_um"]])
-    st.info("합격/불량 판정은 CD 기준만 사용합니다. 원형도·비대칭은 원인 분석을 위한 참고 지표이며 CD가 합격 범위 안이면 최종 합격입니다.")
-    st.subheader("노광시간별 총평")
-    for report in st.session_state["reports"]:
-        st.markdown(
-            f'**{report["노광시간"]} — {report["최종 결과"]} / 종합 CD {report["종합 CD"]}**  \\n'
-            f'{report["불량 판정"]}  \\n'
-            f'가능 원인: {report["가능 원인"]}  \\n'
-            f'개선 방향: {report["개선 방향"]}'
-        )
-    outputs=sorted(ANALYZED.glob("*_analyzed.png"))
-    st.write(f"분석 이미지 {len(outputs)}장 저장됨: `{ANALYZED}`")
-    st.subheader("노광시간별 패턴 판정 이미지")
-    st.caption("초록색 테두리/글씨 = 목표 CD 허용범위 내, 주황색 테두리/글씨 = 허용범위 초과")
-    for exposure in [7, 8, 9, 10, 11]:
-        group = [p for p in outputs if re.search(rf"^{exposure}s_", p.name)]
-        if group:
-            with st.expander(f"{exposure}초 분석 이미지 ({len(group)}장)", expanded=(exposure == 7)):
-                cols = st.columns(2)
-                for idx, img_path in enumerate(group):
-                    with cols[idx % 2]:
-                        st.image(str(img_path), caption=img_path.name, use_container_width=True)
 
-st.caption("불량 판정은 입력한 목표 CD±허용오차 및 영상 형상 지표에 따른 선별입니다. 광학 이미지 경계 오류가 있을 수 있어 실제 공정 불량 확정 전 대표 이미지를 확인하세요. 원본/결과 이미지는 app.py와 같은 컴퓨터의 pr_saved_data 폴더에 저장됩니다.")
+def show_suggestion(groups, P):
+    """큰 숫자(또는 조건별 표) 바로 아래에 제안 한 줄과 접힌 근거를 보여줍니다."""
+    sg = core.suggest(groups, P["target"], P["tol"])
+    if not sg["items"]:
+        st.caption("💡 " + sg["guidance"])
+        for n in sg["notes"]:
+            st.caption("· " + n)
+        return
+    many = len(sg["items"]) > 1
+    for k, it in enumerate(sg["items"]):
+        prefix = f"[{it['label']}] " if many and it["label"] else ""
+        if it["headline"]:
+            st.info(f"💡 제안: {prefix}{it['headline']}")
+        else:
+            st.caption(f"💡 제안 없음: {prefix}{it['reason']}")
+        st.caption(it["nearest"])
+        with st.expander("근거 보기"):
+            st.dataframe(it["table"], hide_index=True, column_config={
+                "평균 CD(µm)": st.column_config.NumberColumn(format="%.2f"),
+                "이미지 간 편차(µm)": st.column_config.NumberColumn(format="%.2f"),
+                "수율(%)": st.column_config.NumberColumn(format="%.0f")})
+            if it["trend"]:
+                st.caption(it["trend"])
+            for n in it["notes"] + (sg["notes"] if k == 0 else []):
+                st.caption("· " + n)
+            st.caption(core.SUGGEST_NOTE)
+
+
+
+def build_rule_based_review(res):
+    """측정 결과만으로 생성하는 규칙 기반 총평. 인과관계나 미측정 물성은 단정하지 않는다."""
+    P, imgs, groups, pads = res["params"], res["images"], res["groups"], res["pads"]
+    target, tol = float(P["target"]), float(P["tol"])
+    lo, hi = target - tol, target + tol
+    measured = imgs[imgs["상태"] == "측정"] if len(imgs) else pd.DataFrame()
+    valid_groups = groups.copy() if len(groups) else pd.DataFrame()
+    used = pads[pads["분류"] == core.C_USED] if len(pads) and "분류" in pads else pd.DataFrame()
+    lines = []
+    lines.append(f"분석 결과 {len(measured)}장의 이미지에서 측정이 완료되었으며, 목표 CD는 {target:.2f} µm, 허용 범위는 {lo:.2f}~{hi:.2f} µm입니다.")
+    if len(used):
+        mean_cd = float(used["CD_um"].mean())
+        median_cd = float(used["CD_um"].median())
+        sd_cd = float(used["CD_um"].std()) if len(used) > 1 else float("nan")
+        delta = mean_cd - target
+        state = "목표보다 큰 편" if delta > tol else "목표보다 작은 편" if delta < -tol else "허용 범위 안"
+        lines.append(f"사용 패드 {len(used)}개의 전체 평균 CD는 {mean_cd:.2f} µm(중앙값 {median_cd:.2f} µm, 패드 간 표준편차 {sd_cd:.2f} µm)이며, 목표 대비 {delta:+.2f} µm로 {state}입니다.")
+        if len(valid_groups):
+            best = valid_groups.sort_values(["수율(%)", "이미지 간 편차(µm)"], ascending=[False, True], na_position="last").iloc[0]
+            lines.append(f"조건별로는 '{best['조건']}'에서 CD 규격 수율 {best['수율(%)']:.1f}%가 관찰되었습니다. 이 조건이 최적이라고 확정하기보다는 반복 측정으로 재현성을 확인할 후보로 보는 것이 적절합니다.")
+            if valid_groups["위치 간 편차(µm)"].notna().any():
+                posrow = valid_groups.loc[valid_groups["위치 간 편차(µm)"].idxmax()]
+                lines.append(f"위치 간 편차가 가장 큰 조건은 '{posrow['조건']}'이며 편차는 {posrow['위치 간 편차(µm)']:.2f} µm입니다. Center·Left-Upper·Right-Down의 위치별 평균을 확인해 웨이퍼/기판 내 균일도 문제인지 점검하세요.")
+        else:
+            lines.append("조건별 비교 데이터가 부족해 어떤 공정 조건이 더 우수한지 판단하기 어렵습니다.")
+    else:
+        lines.append("규격 판정에 사용할 측정 패드가 없습니다. 이미지 초점, 스케일바 보정, 패턴 검출 상태를 먼저 확인해야 합니다.")
+
+    n_est = int((imgs["스케일_상태"] == "추정").sum()) if len(imgs) else 0
+    n_bad = int((imgs["상태"] != "측정").sum()) if len(imgs) else 0
+    if n_est:
+        lines.append(f"측정 이미지 중 {n_est}장은 배율 기본값으로 스케일을 추정했습니다. 해당 결과는 정량 비교의 신뢰도가 낮을 수 있으므로 스케일바가 포함된 이미지로 재보정한 뒤 결론을 확정하세요.")
+    if n_bad:
+        lines.append(f"총 {n_bad}장의 이미지는 측정 완료 상태가 아닙니다. 제외 사유를 확인하고, 분석 가능한 이미지 수가 충분한지 검토하세요.")
+    if len(used) < 30:
+        lines.append("표본 수가 많지 않으므로 평균 CD와 수율은 예비 결과로 해석하고, 조건별 반복 측정을 추가하는 것이 좋습니다.")
+    lines.append("주의: 광학 2D 이미지의 CD만으로 레지스트 막 두께, 측벽 형상, 언더컷 또는 공정 변수의 인과관계를 직접 판정할 수 없습니다.")
+
+    pc = P.get("process_conditions", {})
+    recs = []
+    # 관찰된 CD 편차에 따라 우선 실험 변수를 제시하되, 레지스트 톤/마스크 형상 미확인 시 변화 방향은 가설로 한정한다.
+    if len(used):
+        mean_cd = float(used["CD_um"].mean())
+        if mean_cd > hi:
+            direction = "CD가 목표보다 큽니다. 노광량을 낮추는 방향을 우선 검토하되, Positive/Negative tone과 패턴의 밝고 어두운 영역에 따라 CD 반응 방향이 달라질 수 있으므로 현재 조건의 ±5~10% 범위에서 소규모 확인 실험을 권장합니다."
+        elif mean_cd < lo:
+            direction = "CD가 목표보다 작습니다. 노광량을 높이는 방향을 우선 검토하되, 레지스트 톤과 마스크 패턴에 따라 반응 방향이 달라질 수 있으므로 현재 조건의 ±5~10% 범위에서 소규모 확인 실험을 권장합니다."
+        else:
+            direction = "평균 CD는 허용 범위 안입니다. 평균을 더 움직이기보다 위치 간 편차와 패드 간 산포를 줄이는 방향으로 공정 안정성을 확인하는 것이 우선입니다."
+        recs.append(("1순위 · Exposure", f"현재 {pc.get('exposure_time_s', '미입력')} s", direction + " 한 번에 노광 시간만 바꾸고 나머지 7개 변수는 고정하세요."))
+    recs.append(("2순위 · Spin coating", f"현재 {pc.get('spin_rpm', '미입력')} rpm", "막 두께와 패턴 형상에 영향을 줄 수 있으므로 현재 회전속도 기준 ±5% 수준의 2~3점 비교를 권장합니다. CD 변화와 함께 막 두께 측정이 가능하면 병행하세요."))
+    recs.append(("3순위 · Soft bake", f"현재 {pc.get('soft_bake_temp_c', '미입력')} °C / {pc.get('soft_bake_time_s', '미입력')} s", "용매 제거 및 레지스트 상태에 영향을 줄 수 있습니다. 온도 또는 시간 중 하나만 선택해 현재값 주변의 작은 간격(예: 온도 ±5 °C 또는 시간 ±10 s)으로 비교하세요."))
+    recs.append(("4순위 · IRB", f"현재 {pc.get('irb_temp_c', '미입력')} °C / {pc.get('irb_time_s', '미입력')} s", "IRB의 정확한 공정 정의와 레지스트 재료 사양을 확인한 뒤 조절하세요. 우선 온도 또는 시간 한 변수만 현재값 주변(예: ±5 °C 또는 ±10 s)에서 비교합니다."))
+    recs.append(("5순위 · Development", f"현재 {pc.get('development_time_s', '미입력')} s", "현상 부족/과다 여부를 현상 후 잔사와 패턴 손실로 함께 확인하세요. 현재 시간 기준 ±5~10 s 범위의 소규모 비교를 권장하며, CD만 보고 방향을 단정하지 마세요."))
+    recs.append(("유지 권장 · DI rinse", f"현재 {pc.get('di_rinse_time_s', '미입력')} s", "DI 세척은 CD 조절용 변수로 먼저 사용하지 말고, 잔류 현상액 제거가 충분한지 확인한 뒤 현재 조건을 고정하는 편이 좋습니다."))
+    return lines, recs
+
+
+def show_rule_based_review(res):
+    lines, recs = build_rule_based_review(res)
+    st.divider()
+    st.subheader("📋 데이터 기반 자동 총평")
+    st.caption("외부 API·유료 AI 없이 측정값과 사전 정의된 분석 규칙으로 생성합니다.")
+    for line in lines:
+        st.write("• " + line)
+    st.subheader("🧪 추천 공정변수 조절 방향")
+    st.warning("아래 조절 폭은 보편적인 최적 조건이 아니라 다음 실험을 설계하기 위한 초기 탐색 범위입니다. 레지스트 종류·톤·장비·공정 사양을 확인하고, 안전한 장비 운전 범위 안에서 적용하세요.")
+    for title, current, advice in recs:
+        with st.expander(f"{title}  |  {current}", expanded=(title.startswith("1순위"))):
+            st.write(advice)
+    st.markdown("**권장 실험 순서:** 기준 조건 반복 측정 → Exposure만 변경 → 가장 유망한 노광 조건 고정 → Spin coating 또는 Soft bake 중 한 변수만 변경 → IRB/Development 순으로 검토. 각 단계에서 최소 3회 반복하고 평균 CD, 표준편차, 위치 간 편차, 수율을 함께 비교하세요.")
+
+
+def show_results(res):
+    P, imgs, groups = res["params"], res["images"], res["groups"]
+    st.divider()
+    if (P["target"], P["tol"]) != (target_cd, tolerance_um):
+        st.info("목표 CD 또는 허용오차가 바뀌었습니다. [분석하기]를 다시 누르면 반영됩니다.")
+    n_est = int((imgs["스케일_상태"] == "추정").sum()) if len(imgs) else 0
+    n_no = int((imgs["상태"] == "측정 불가").sum()) if len(imgs) else 0
+    n_un = int((imgs["상태"] == "지원 안 함").sum()) if len(imgs) else 0
+    if n_est:
+        st.warning(f"스케일을 추정한 이미지가 {n_est}장 있습니다. 배율 기본값으로 계산한 값이라 정확도가 낮을 수 있고, 요약에서 따로 표시했습니다.")
+    if n_no:
+        st.warning(f"스케일바와 배율이 모두 없어 측정하지 못한 이미지가 {n_no}장 있습니다.")
+    if n_un:
+        st.warning(f"원형 패드 배열이 아니어서 측정하지 않은 이미지가 {n_un}장 있습니다. (현재는 원형 패드 배열만 지원합니다)")
+    if res["changed"]:
+        st.caption("※ 기본값에서 바꾼 설정: " + ", ".join(res["changed"]))
+    if not len(groups):
+        st.info("측정된 이미지가 없습니다. 아래 이미지별 안내를 확인하세요.")
+    elif len(groups) == 1:
+        g = groups.iloc[0]
+        if g["스케일"] == "추정":
+            st.warning("이 결과는 배율 기본값으로 계산한 추정치입니다.")
+        show_cards(g, P)
+        st.caption(f"목표 {P['target']:g} µm ± {P['tol']:g} µm · 경계 기준: 까만 테두리 바깥 끝(25% 지점)")
+        show_suggestion(groups, P)
+    else:
+        st.subheader("조건별 결과")
+        t = groups[["신호", "조건", "스케일", "평균 CD(µm)", "목표와 차이(µm)", "수율(%)", "사용 패드", "이미지 간 편차(µm)"]].copy()
+        t["스케일"] = t["스케일"].map({"정확": "정확", "추정": "⚠ 추정"})
+        st.dataframe(t, hide_index=True, column_config={
+            "평균 CD(µm)": st.column_config.NumberColumn(format="%.2f"), "목표와 차이(µm)": st.column_config.NumberColumn(format="%+.2f"),
+            "수율(%)": st.column_config.NumberColumn(format="%.0f"), "이미지 간 편차(µm)": st.column_config.NumberColumn(format="%.2f")})
+        if groups["패턴"].nunique() > 1:
+            st.caption("목표 CD는 하나만 입력되므로, 패턴이 다르면 목표와의 차이와 판정은 해당 패턴에만 의미가 있습니다.")
+        st.caption(f"목표 {P['target']:g} µm ± {P['tol']:g} µm · 수율은 CD 규격 기준 치수 수율(누락된 패드는 세지 못함)")
+        show_suggestion(groups, P)
+        if groups.loc[groups["실험 조건"] != "", "실험 조건"].nunique() >= 2:
+            st.altair_chart(group_chart(imgs, groups, P))
+            st.caption("점: 이미지 1장의 평균 CD · 선: 조건 평균 · 초록 띠: 허용 범위 · ◆: 스케일 추정치 · 세로축은 0에서 시작하지 않습니다.")
+
+    show_rule_based_review(res)
+
+    st.subheader("이미지별 결과")
+    for k, (_, row) in enumerate(imgs.iterrows()):
+        show_image_card(row, res, k)
+
+    with st.popover("⬇ 내려받기"):
+        st.download_button("결과 전체 (zip: CSV 3개 + settings.csv + 분석 이미지)", res["files"]["zip"], "pattern_cd_results.zip", "application/zip")
+        st.download_button("패드별 CSV", res["files"].get("pads", b""), "pads.csv", "text/csv")
+        st.download_button("이미지별 CSV", res["files"]["images"], "images.csv", "text/csv")
+        st.download_button("조건별 요약 CSV", res["files"]["groups"], "summary.csv", "text/csv")
+
+
+if "res" in st.session_state:
+    show_results(st.session_state["res"])
+
+st.caption("판정은 입력한 목표 CD ± 허용오차에 따른 선별이며 공정 불량의 확정이 아닙니다. 광학 이미지로는 단면(언더컷)을 볼 수 없고, "
+           "CD는 경계 기준(까만 테두리 바깥 끝)에 따라 달라집니다. 현재는 원형 패드 배열만 지원합니다.")
+
+
